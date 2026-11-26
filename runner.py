@@ -15,15 +15,8 @@ if BACKEND_ROOT not in sys.path:
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'saleor.settings')
 
-import django
-django.setup()
-
 import argparse
 import logging
-from saleor.product.models import ProductType
-from saleor.channel.models import Channel
-from saleor.warehouse.models import Warehouse
-from imports.importer.engine.orchestrator import run_import
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -34,8 +27,30 @@ def main():
     parser.add_argument('--channel', default='default-channel', help='Saleor channel slug')
     parser.add_argument('--warehouse', default='default-warehouse', help='Saleor warehouse slug')
     parser.add_argument('--product-type', default='default-type', help='Saleor product type slug')
-    
+    parser.add_argument(
+        '--confirm-write',
+        action='store_true',
+        help='Explicitly authorise database writes for this catalogue import',
+    )
+
     args = parser.parse_args()
+
+    if not args.confirm_write:
+        parser.error(
+            "This importer writes to Saleor. Re-run with --confirm-write "
+            "only after reviewing the input file and target channel, warehouse "
+            "and product type."
+        )
+
+    # Do not initialise Django or import database models until the explicit
+    # write-confirmation guard has passed.
+    import django
+    django.setup()
+
+    from saleor.product.models import ProductType
+    from saleor.channel.models import Channel
+    from saleor.warehouse.models import Warehouse
+    from imports.importer.engine.orchestrator import run_import
 
     try:
         channel = Channel.objects.filter(slug=args.channel).first()

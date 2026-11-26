@@ -66,7 +66,26 @@ class SupplierOfferRepository:
             ):
                 raise ValueError("Invalid supplier lead time")
 
-        payload = json.dumps(raw_data or {})
+        if not isinstance(tax_inclusive, bool):
+            raise ValueError("tax_inclusive must be a boolean")
+
+        try:
+            if raw_data is None:
+                raw_payload = {}
+            elif isinstance(raw_data, str):
+                # PostgreSQL JSONB may be returned as serialized JSON text.
+                # Decode it before json.dumps(), otherwise JSON objects become
+                # JSON string scalars when stored in the JSONB column.
+                raw_payload = json.loads(raw_data)
+            else:
+                raw_payload = raw_data
+
+            if not isinstance(raw_payload, dict):
+                raise ValueError("Supplier offer raw data must be a JSON object")
+
+            payload = json.dumps(raw_payload, default=str)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid supplier offer raw data; expected a JSON object") from None
 
         with transaction.atomic():
 

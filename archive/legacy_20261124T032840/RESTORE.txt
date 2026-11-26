@@ -1,0 +1,11 @@
+Legacy quarantine 20261124T032840
+
+Files were MOVED, not deleted. Restore any file with:
+  mv archive/legacy_20261124T032840/<path> <path>
+
+engine/canonical/snapshot_lifecycle.py
+engine/canonical/snapshot_pipeline.py
+engine/canonical/test_snapshot_lifecycle.py
+engine/canonical/test_snapshot_pipeline.py
+engine/media.py.before_cleanup
+snapshot_cli.py

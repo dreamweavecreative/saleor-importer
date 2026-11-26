@@ -121,7 +121,10 @@ def _safe_listing(price, cost):
         if not caag_check_pricing_safety(cost, price):
             return False
     except Exception:
-        pass
+        # Pricing safety is a hard gate. An unavailable or broken safety
+        # check must never make a listing eligible.
+        logger.exception("pricing safety check failed; listing rejected")
+        return False
     if price is None:
         return False
     if price <= 0:
@@ -232,7 +235,7 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
 
         if new_products:
             Product.objects.bulk_create(new_products, ignore_conflicts=True)
-            stats["products_created"] += len(new_products)
+            stats["products_create_attempted"] += len(new_products)
 
         slug_map = {
             p.slug: p.id
@@ -244,7 +247,55 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
             if not p.get("product_id"):
                 p["product_id"] = slug_map.get(p["product_data"]["slug"])
 
-        # ---- 2. upsert new variants ----
+        # ---- 2. validate global SKU ownership before variant writes ----
+        # Saleor variant SKUs are globally unique. A feed row must never
+        # silently attach an existing SKU to a different product.
+        sku_product_map = {}
+        for payload in payloads:
+            sku = payload.get("sku")
+            if not sku:
+                continue
+
+            intended_product_id = payload.get("product_id")
+            if not intended_product_id:
+                raise ValueError(
+                    "SKU ownership validation failed: "
+                    f"SKU {sku!r} has no resolved product_id"
+                )
+
+            previous_product_id = sku_product_map.get(sku)
+            if (
+                previous_product_id is not None
+                and previous_product_id != intended_product_id
+            ):
+                raise ValueError(
+                    "SKU ownership conflict inside import batch: "
+                    f"SKU {sku!r} maps to product IDs "
+                    f"{previous_product_id!r} and {intended_product_id!r}"
+                )
+
+            sku_product_map[sku] = intended_product_id
+
+        existing_sku_owners = dict(
+            ProductVariant.objects.filter(
+                sku__in=list(sku_product_map)
+            ).values_list("sku", "product_id")
+        )
+
+        for sku, intended_product_id in sku_product_map.items():
+            existing_product_id = existing_sku_owners.get(sku)
+            if (
+                existing_product_id is not None
+                and existing_product_id != intended_product_id
+            ):
+                raise ValueError(
+                    "Existing Saleor SKU belongs to a different product; "
+                    "refusing to re-parent variant: "
+                    f"SKU={sku!r}, existing_product_id={existing_product_id!r}, "
+                    f"intended_product_id={intended_product_id!r}"
+                )
+
+        # ---- 3. upsert new variants ----
         to_upsert, upsert_slugs = [], set()
         for p in payloads:
             if p["action"] == "UPDATE_VARIANT_AND_OFFER" or not p.get("product_id"):
@@ -272,9 +323,11 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
                 to_upsert,
                 update_conflicts=True,
                 unique_fields=["sku"],
-                update_fields=["name", "weight", "track_inventory", "product_id", "updated_at"],
+                # product_id is deliberately excluded: ownership was
+                # validated above and must never be changed by conflict upsert.
+                update_fields=["name", "weight", "track_inventory", "updated_at"],
             )
-            stats["variants_upserted"] += len(to_upsert)
+            stats["variants_upsert_attempted"] += len(to_upsert)
 
         # ---- 3. resolve variants by SKU ----
         skus = [p["sku"] for p in payloads if p.get("sku")]
@@ -347,7 +400,7 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
 
         if v_updates:
             ProductVariant.objects.bulk_update(
-                v_updates, ["private_metadata", "track_inventory", "updated_at"]
+                v_updates, ["private_metadata", "track_inventory", "sort_order", "updated_at"]
             )
 
         # ---- 6. backfill existing products ----
@@ -409,7 +462,7 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
                 ["category_id", "product_type_id", "seo_title", "seo_description",
                  "tax_class_id", "metadata", "search_index_dirty", "updated_at"],
             )
-            stats["products_backfilled"] += len(prod_updates)
+            stats["products_backfill_attempted"] += len(prod_updates)
 
         # ---- 7. manufacturer attribute assignments ----
         type_ids = set(Product.objects.filter(id__in=pids).values_list("product_type_id", flat=True))
@@ -428,9 +481,46 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
                     product_id=pid, value_id=value_id, sort_order=0
                 ))
 
+        # Manufacturer is a single-valued product identity attribute in
+        # this importer. Do not add a second or conflicting value silently.
+        expected_manufacturer_by_product = {}
+        for assignment in assignments:
+            pid = assignment.product_id
+            value_id = assignment.value_id
+            previous = expected_manufacturer_by_product.get(pid)
+            if previous is not None and previous != value_id:
+                raise ValueError(
+                    "Conflicting manufacturer values in import batch for "
+                    f"product_id={pid!r}: {previous!r} vs {value_id!r}"
+                )
+            expected_manufacturer_by_product[pid] = value_id
+
+        if expected_manufacturer_by_product:
+            manufacturer_attr = Attribute.objects.get(slug="manufacturer")
+            existing_manufacturers = (
+                AssignedProductAttributeValue.objects.filter(
+                    product_id__in=list(expected_manufacturer_by_product),
+                    value__attribute=manufacturer_attr,
+                ).values_list("product_id", "value_id")
+            )
+
+            existing_by_product = defaultdict(set)
+            for pid, value_id in existing_manufacturers:
+                existing_by_product[pid].add(value_id)
+
+            for pid, expected_value_id in expected_manufacturer_by_product.items():
+                existing_values = existing_by_product.get(pid, set())
+                if existing_values and existing_values != {expected_value_id}:
+                    raise ValueError(
+                        "Existing manufacturer assignment conflicts with "
+                        "incoming manufacturer; refusing additive assignment: "
+                        f"product_id={pid!r}, existing_values={sorted(existing_values)!r}, "
+                        f"incoming_value_id={expected_value_id!r}"
+                    )
+
         if assignments:
             AssignedProductAttributeValue.objects.bulk_create(assignments, ignore_conflicts=True)
-            stats["manufacturer_assignments"] += len(assignments)
+            stats["manufacturer_assignments_attempted"] += len(assignments)
 
         # ---- 8. variant channel listings: price + cost + safety ----
         vcl = []
@@ -460,7 +550,7 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
                                "discounted_price_amount", "currency",
                                "is_available_for_purchase"],
             )
-            stats["variant_listings"] += len(vcl)
+            stats["variant_listings_upsert_attempted"] += len(vcl)
 
         # ---- 9. product channel listings ----
         priced_products = {
@@ -488,7 +578,7 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
                                "available_for_purchase_at", "currency",
                                "discounted_price_dirty"],
             )
-            stats["products_published"] += len(pcl)
+            stats["products_publish_upsert_attempted"] += len(pcl)
 
         stats["products_unpriced"] += len(
             {a["variant"].product_id for a in agg.values()} - priced_products
@@ -518,7 +608,7 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
 
         if dv:
             Product.objects.bulk_update(dv, ["default_variant_id"])
-            stats["default_variants_set"] += len(dv)
+            stats["default_variants_set_attempted"] += len(dv)
 
         # ---- 12. canonical collections ----
         wanted_slugs = {slug for slug, _ in taxonomy.all_collections()}
@@ -547,7 +637,7 @@ def write_batch(payloads, default_product_type_id, default_channel_id, default_w
 
         if links:
             CollectionProduct.objects.bulk_create(links, ignore_conflicts=True)
-            stats["collection_links"] += len(links)
+            stats["collection_links_attempted"] += len(links)
 
     logger.info("batch written: %s", dict(stats))
     return dict(stats)

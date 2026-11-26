@@ -50,6 +50,7 @@ def api_config():
         "google_key": get("GOOGLE_CSE_KEY"),
         "google_cx": get("GOOGLE_CSE_CX"),
         "bing_key": get("BING_IMAGE_KEY"),
+        "scrappa_key": get("SCRAPPA_API_KEY") or get("SCRAPPA_KEY"),
     }
 
 

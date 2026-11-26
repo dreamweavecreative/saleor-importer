@@ -28,6 +28,7 @@ from .reconciliation import (
 from .repository import CanonicalRepository
 
 from .supplier_offers import SupplierOfferRepository
+from . import offer_scoped
 
 
 class DuplicateFeedError(Exception):
@@ -261,7 +262,7 @@ def normalize_record(raw, mapping=None):
     if currency is not None:
         currency = str(currency).strip().upper()
 
-        if len(currency) != 3 or not currency.isalpha():
+        if len(currency) != 3 or not currency.isascii() or not currency.isalpha():
             raise ValueError("Invalid currency")
 
     if price is not None and not currency:
@@ -350,6 +351,386 @@ def calculate_fingerprint(supplier_id, records):
         _canonical_json(payload).encode("utf-8")
     ).hexdigest()
 
+
+
+
+def stage_dickerdata_feed(path, supplier_id="dickerdata", feed_format="CSV", expected_fingerprint=None):
+    """
+    Bounded-memory DickerData staging.
+
+    Pass 1 validates and normalizes eligible rows and externally sorts the
+    normalized JSON records to reproduce calculate_fingerprint() exactly.
+
+    Pass 2 inserts the batch and staged rows in one transaction, using
+    bounded executemany batches. The source file is hashed before and after
+    processing so a changed feed cannot be staged under a stale fingerprint.
+
+    This function never reconciles, creates offers, or modifies Saleor data.
+    """
+    import csv
+    import hashlib
+    import heapq
+    import os
+    import tempfile
+    from collections import Counter
+    from pathlib import Path
+
+    from importer.engine.dickerdata_adapter import (
+        EXPECTED_COLUMNS,
+        UNLIMITED_STOCK_SENTINEL,
+        adapt_records,
+    )
+
+    supplier_id = str(supplier_id or "").strip().lower()
+    feed_format = str(feed_format or "").strip().upper()
+
+    if supplier_id != "dickerdata":
+        raise ValueError("Streaming staging is restricted to dickerdata.")
+    if feed_format != "CSV":
+        raise ValueError("DickerData streaming staging supports CSV only.")
+
+    feed_path = Path(path).expanduser()
+    if not feed_path.is_file() or feed_path.stat().st_size <= 0:
+        raise ValueError("Feed path is missing, not a regular file, or empty.")
+
+    CHUNK_RECORDS = 1000
+    INSERT_BATCH = 500
+
+    def file_sha256():
+        digest = hashlib.sha256()
+        with feed_path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def is_blank_row(row):
+        return not any(
+            value is not None and str(value).strip()
+            for value in row.values()
+        )
+
+    def eligible(row):
+        return (
+            str(row.get("Status") or "").strip().upper() == "A"
+            and str(row.get("Type") or "").strip().casefold() == "stockeditem"
+        )
+
+    source_digest_before = file_sha256()
+    source_rows = 0
+    eligible_rows = 0
+    excluded_rows = 0
+    sentinel_rows = 0
+    status_counts = Counter()
+    type_counts = Counter()
+    chunk_values = []
+
+    with tempfile.TemporaryDirectory(prefix="dickerdata_stage_") as temp_dir:
+        temp_path = Path(temp_dir)
+        chunk_paths = []
+
+        def flush_sort_chunk():
+            if not chunk_values:
+                return
+            chunk_values.sort()
+            chunk_file = temp_path / f"sort_{len(chunk_paths):06d}.jsonl"
+            with chunk_file.open("w", encoding="utf-8", newline="\n") as out:
+                for value in chunk_values:
+                    out.write(value)
+                    out.write("\n")
+            chunk_paths.append(chunk_file)
+            chunk_values.clear()
+
+        # PASS 1: validate, normalize and externally sort fingerprint records.
+        with feed_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            headers = reader.fieldnames or []
+
+            clean_headers = [str(h).strip() if h else "" for h in headers]
+            if len(clean_headers) != len(set(h.casefold() for h in clean_headers)):
+                raise ValueError("DickerData CSV contains duplicate headers.")
+            if set(clean_headers) != set(EXPECTED_COLUMNS):
+                raise ValueError(
+                    "DickerData CSV schema mismatch: "
+                    f"missing={sorted(set(EXPECTED_COLUMNS)-set(clean_headers))}; "
+                    f"unexpected={sorted(set(clean_headers)-set(EXPECTED_COLUMNS))}"
+                )
+            reader.fieldnames = clean_headers
+
+            for row in reader:
+                if is_blank_row(row):
+                    continue
+                source_rows += 1
+
+                if None in row:
+                    raise ValueError(
+                        f"CSV row {source_rows + 1} contains extra columns."
+                    )
+
+                status = str(row.get("Status") or "").strip().upper()
+                item_type = str(row.get("Type") or "").strip()
+                status_counts[status or "<blank>"] += 1
+                type_counts[item_type or "<blank>"] += 1
+
+                if not eligible(row):
+                    excluded_rows += 1
+                    continue
+
+                adapted_rows, adapter_summary = adapt_records([row])
+                if len(adapted_rows) != 1:
+                    raise RuntimeError("Eligible source row did not adapt to one record.")
+
+                adapted = adapted_rows[0]
+                normalized = normalize_record(adapted)
+
+                # Match calculate_fingerprint(): sort canonical JSON strings.
+                chunk_values.append(_canonical_json(normalized))
+                eligible_rows += 1
+
+                if str(row.get("StockAvailable") or "").strip() == str(UNLIMITED_STOCK_SENTINEL):
+                    sentinel_rows += 1
+
+                if len(chunk_values) >= CHUNK_RECORDS:
+                    flush_sort_chunk()
+
+        if not eligible_rows:
+            raise ValueError("DickerData feed contains no eligible stocked items.")
+
+        flush_sort_chunk()
+
+        # Reproduce the exact JSON serialization shape used by
+        # calculate_fingerprint(), without materializing the records array.
+        fingerprint_hash = hashlib.sha256()
+        fingerprint_hash.update(b'{"records":[')
+
+        first = True
+        iterators = [
+            chunk.open("r", encoding="utf-8", newline="")
+            for chunk in chunk_paths
+        ]
+        try:
+            for line in heapq.merge(*iterators):
+                value = line.rstrip("\n")
+                if not first:
+                    fingerprint_hash.update(b",")
+                fingerprint_hash.update(value.encode("utf-8"))
+                first = False
+        finally:
+            for iterator in iterators:
+                iterator.close()
+
+        fingerprint_hash.update(b'],"supplier_id":')
+        fingerprint_hash.update(_canonical_json(supplier_id).encode("utf-8"))
+        fingerprint_hash.update(b"}")
+        fingerprint = fingerprint_hash.hexdigest()
+
+        if expected_fingerprint and fingerprint != expected_fingerprint:
+            raise RuntimeError(
+                "Fingerprint guard rejected feed before database writes: "
+                f"expected {expected_fingerprint}, calculated {fingerprint}"
+            )
+
+        # Ensure the feed was not modified while fingerprinting.
+        if file_sha256() != source_digest_before:
+            raise RuntimeError("Feed changed during fingerprint calculation.")
+
+        inserted_rows = 0
+        batch_id = None
+
+        # PASS 2: one atomic batch insert and bounded row inserts.
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL lock_timeout = '15s'")
+                cursor.execute("SET LOCAL statement_timeout = '15min'")
+
+                try:
+                    with transaction.atomic():
+                        cursor.execute("""
+                            INSERT INTO catalogue.supplier_import_batches (
+                                supplier_id,
+                                feed_format,
+                                feed_fingerprint,
+                                status,
+                                total_rows
+                            )
+                            VALUES (%s, %s, %s, 'PROCESSING', %s)
+                            RETURNING id
+                        """, [
+                            supplier_id,
+                            feed_format,
+                            fingerprint,
+                            eligible_rows,
+                        ])
+                        batch_id = cursor.fetchone()[0]
+
+                except IntegrityError:
+                    cursor.execute("""
+                        SELECT id
+                        FROM catalogue.supplier_import_batches
+                        WHERE supplier_id = %s
+                          AND feed_fingerprint = %s
+                        LIMIT 1
+                    """, [supplier_id, fingerprint])
+                    existing = cursor.fetchone()
+                    raise DuplicateFeedError(
+                        "Duplicate supplier feed. Existing batch: "
+                        + str(existing[0] if existing else "unknown")
+                    )
+
+                pending = []
+                row_number = 0
+
+                with feed_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    reader.fieldnames = [
+                        str(h).strip() if h else ""
+                        for h in (reader.fieldnames or [])
+                    ]
+
+                    for source_row in reader:
+                        if is_blank_row(source_row):
+                            continue
+                        if None in source_row:
+                            raise ValueError(
+                                "CSV row contains extra columns during insert pass."
+                            )
+                        if not eligible(source_row):
+                            continue
+
+                        adapted_rows, _ = adapt_records([source_row])
+                        if len(adapted_rows) != 1:
+                            raise RuntimeError(
+                                "Eligible source row failed adaptation on insert pass."
+                            )
+
+                        adapted = adapted_rows[0]
+                        record = normalize_record(adapted)
+                        row_number += 1
+
+                        pending.append((
+                            str(batch_id),
+                            row_number,
+                            record["supplier_sku"],
+                            record["product_name"],
+                            record.get("manufacturer"),
+                            record.get("brand"),
+                            record.get("gtin"),
+                            record.get("mpn"),
+                            record.get("supplier_price"),
+                            record.get("currency"),
+                            record.get("stock_quantity"),
+                            record.get("minimum_order_quantity"),
+                            _canonical_json(adapted),
+                        ))
+
+                        if len(pending) >= INSERT_BATCH:
+                            cursor.executemany("""
+                                INSERT INTO catalogue.supplier_import_rows (
+                                    batch_id,
+                                    row_number,
+                                    supplier_sku,
+                                    product_name,
+                                    manufacturer,
+                                    brand,
+                                    gtin,
+                                    mpn,
+                                    supplier_price,
+                                    currency,
+                                    stock_quantity,
+                                    minimum_order_quantity,
+                                    raw_record,
+                                    status
+                                )
+                                VALUES (
+                                    %s,%s,%s,%s,%s,%s,%s,%s,
+                                    %s,%s,%s,%s,%s::jsonb,'PENDING'
+                                )
+                            """, pending)
+                            inserted_rows += len(pending)
+                            pending.clear()
+
+                    if pending:
+                        cursor.executemany("""
+                            INSERT INTO catalogue.supplier_import_rows (
+                                batch_id,
+                                row_number,
+                                supplier_sku,
+                                product_name,
+                                manufacturer,
+                                brand,
+                                gtin,
+                                mpn,
+                                supplier_price,
+                                currency,
+                                stock_quantity,
+                                minimum_order_quantity,
+                                raw_record,
+                                status
+                            )
+                            VALUES (
+                                %s,%s,%s,%s,%s,%s,%s,%s,
+                                %s,%s,%s,%s,%s::jsonb,'PENDING'
+                            )
+                        """, pending)
+                        inserted_rows += len(pending)
+                        pending.clear()
+
+                if row_number != eligible_rows or inserted_rows != eligible_rows:
+                    raise RuntimeError(
+                        "Staging row-count mismatch: "
+                        f"fingerprint_pass={eligible_rows}, "
+                        f"insert_pass={row_number}, inserted={inserted_rows}"
+                    )
+
+                cursor.execute("""
+                    SELECT
+                        COUNT(*),
+                        COUNT(*) FILTER (WHERE status = 'PENDING'),
+                        COUNT(*) FILTER (WHERE status <> 'PENDING')
+                    FROM catalogue.supplier_import_rows
+                    WHERE batch_id = %s
+                """, [str(batch_id)])
+                actual_total, pending_total, non_pending = cursor.fetchone()
+
+                if (
+                    actual_total != eligible_rows
+                    or pending_total != eligible_rows
+                    or non_pending != 0
+                ):
+                    raise RuntimeError(
+                        "Post-insert verification failed: "
+                        f"total={actual_total}, pending={pending_total}, "
+                        f"non_pending={non_pending}"
+                    )
+
+                # Detect a feed replacement/change during the DB insert pass.
+                if file_sha256() != source_digest_before:
+                    raise RuntimeError(
+                        "Feed changed during staging; transaction will roll back."
+                    )
+
+        return {
+            "batch_id": str(batch_id),
+            "status": "PROCESSING",
+            "supplier_id": supplier_id,
+            "feed_format": feed_format,
+            "fingerprint": fingerprint,
+            "source_rows": source_rows,
+            "eligible_rows": eligible_rows,
+            "excluded_rows": excluded_rows,
+            "inserted_rows": inserted_rows,
+            "unlimited_stock_sentinel_rows": sentinel_rows,
+            "source_status_counts": dict(sorted(status_counts.items())),
+            "source_type_counts": dict(sorted(type_counts.items())),
+            "memory_strategy": {
+                "feed_processing": "two-pass streaming CSV",
+                "fingerprint": "external disk-backed sort",
+                "fingerprint_chunk_records": CHUNK_RECORDS,
+                "database_insert_batch": INSERT_BATCH,
+                "full_feed_loaded_into_memory": False,
+            },
+            "reconciliation_started": False,
+            "offers_created": False,
+        }
 
 
 def create_import_batch(supplier_id, feed_format, records):
@@ -488,6 +869,95 @@ def create_import_batch(supplier_id, feed_format, records):
             return batch_id
 
 
+def _resolve_dickerdata_variant(cursor, supplier_sku):
+    """
+    Resolve DickerData StockCode to one exact Saleor variant and its
+    canonical variant-level record.
+
+    Returns (canonical_product_id, matching_method), or
+    (None, "UNMATCHED") when either bridge is absent.
+
+    Ambiguous Saleor SKUs, duplicate canonical variant bridges, and
+    inconsistent Saleor product/variant associations are conflicts.
+    No MPN or fuzzy fallback is permitted.
+    """
+    from .reconciliation import IdentityConflict
+
+    sku = str(supplier_sku or "").strip().upper()
+    if not sku:
+        raise ValueError("DickerData StockCode is required")
+
+    cursor.execute("""
+        SELECT
+            v.id,
+            v.product_id
+        FROM public.product_productvariant v
+        WHERE UPPER(BTRIM(v.sku)) = %s
+    """, [sku])
+
+    variants = cursor.fetchall()
+
+    if not variants:
+        return None, "UNMATCHED"
+
+    if len(variants) != 1:
+        raise IdentityConflict(
+            "DickerData StockCode resolves to multiple Saleor variants: "
+            + sku
+        )
+
+    saleor_variant_id, saleor_product_id = variants[0]
+
+    cursor.execute("""
+        SELECT
+            id,
+            saleor_product_id,
+            saleor_variant_id
+        FROM catalogue.canonical_products
+        WHERE saleor_variant_id = %s
+    """, [str(saleor_variant_id)])
+
+    canonical_rows = cursor.fetchall()
+
+    if not canonical_rows:
+        return None, "UNMATCHED"
+
+    if len(canonical_rows) != 1:
+        raise IdentityConflict(
+            "Multiple canonical records reference Saleor variant: "
+            + str(saleor_variant_id)
+        )
+
+    canonical_id, canonical_saleor_product_id, canonical_saleor_variant_id = (
+        canonical_rows[0]
+    )
+
+    if str(canonical_saleor_variant_id) != str(saleor_variant_id):
+        raise IdentityConflict(
+            "Canonical Saleor variant bridge does not match resolved SKU"
+        )
+
+    if str(canonical_saleor_product_id) != str(saleor_product_id):
+        raise IdentityConflict(
+            "Canonical Saleor product/variant association is inconsistent"
+        )
+
+    return canonical_id, "DICKERDATA_STOCKCODE"
+
+
+def _batch_completion_status(counts):
+    """
+    A batch is cleanly completed only when every row is matched.
+    Unmatched rows require investigation and must not appear successful.
+    """
+    errors = (
+        int(counts.get("UNMATCHED", 0))
+        + int(counts.get("CONFLICT", 0))
+        + int(counts.get("INVALID", 0))
+    )
+    return "COMPLETED_WITH_ERRORS" if errors else "COMPLETED"
+
+
 def _process_row(cursor, batch_id, row):
 
     (
@@ -526,11 +996,20 @@ def _process_row(cursor, batch_id, row):
         )
     """, [lock_key])
 
-    product_id, method = resolve_identity(
-        gtin=gtin,
-        mpn=mpn,
-        manufacturer=manufacturer,
-    )
+    if str(supplier_id).strip().lower() == "dickerdata":
+        # DickerData StockCode is the supplier's exact Saleor variant SKU.
+        # Do not use manufacturer-scoped MPN as a fallback: MPN collisions
+        # across different Saleor products have been observed in this feed.
+        product_id, method = _resolve_dickerdata_variant(
+            cursor,
+            supplier_sku,
+        )
+    else:
+        product_id, method = resolve_identity(
+            gtin=gtin,
+            mpn=mpn,
+            manufacturer=manufacturer,
+        )
 
     if not product_id:
 
@@ -547,18 +1026,29 @@ def _process_row(cursor, batch_id, row):
     # All following operations occur inside the row savepoint
     # established by reconcile_import_batch.
 
-    register_identity(
-        product_id,
-        gtin=gtin,
-        mpn=mpn,
-        manufacturer=manufacturer,
-    )
+    # DickerData identity is established by the Saleor variant SKU bridge.
+    # Do not register VendorStockCode/MPN as a canonical identity: it is not
+    # sufficiently unique for this supplier's catalogue.
+    if str(supplier_id).strip().lower() != "dickerdata":
+        register_identity(
+            product_id,
+            gtin=gtin,
+            mpn=mpn,
+            manufacturer=manufacturer,
+        )
 
-    CanonicalRepository.link_supplier(
-        product_id,
-        supplier_id,
-        supplier_sku,
-    )
+    try:
+        CanonicalRepository.link_supplier(
+            product_id,
+            supplier_id,
+            supplier_sku,
+        )
+    except ValueError as exc:
+        if str(exc) == (
+            "Supplier SKU already linked to another canonical product"
+        ):
+            raise IdentityConflict(str(exc)) from exc
+        raise
 
     cursor.execute("""
         SELECT id, canonical_product_id
@@ -585,7 +1075,9 @@ def _process_row(cursor, batch_id, row):
 
     if price is not None:
 
-        SupplierOfferRepository.upsert(
+        offer_scoped.upsert_scoped(
+            cursor,
+            batch_id,
             supplier_link_id=supplier_link_id,
             unit_cost=price,
             currency=currency,
@@ -623,159 +1115,177 @@ def _process_row(cursor, batch_id, row):
     return "MATCHED"
 
 
-def reconcile_import_batch(batch_id):
+def reconcile_import_batch(batch_id, chunk_size=250, max_chunks=None):
+    """
+    Reconcile pending rows in bounded, independently committed chunks.
 
-    counts = {
-        "MATCHED": 0,
-        "UNMATCHED": 0,
-        "CONFLICT": 0,
-        "INVALID": 0,
-    }
+    The batch row is locked for the duration of each chunk. This serializes
+    row selection between concurrent reconcilers without holding one
+    transaction open for the entire batch.
 
-    with transaction.atomic():
+    Unexpected exceptions roll back only the current chunk. Previously
+    committed chunks remain persisted, and a later invocation resumes from
+    the remaining PENDING rows.
 
-        with connection.cursor() as cursor:
+    max_chunks is a test/control parameter. Production callers should omit it.
+    """
 
-            # One worker at a time may reconcile a batch.
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError("chunk_size must be a positive integer")
 
-            cursor.execute("""
-                SELECT id, supplier_id
-                FROM catalogue.supplier_import_batches
-                WHERE id = %s
-                FOR UPDATE
-            """, [str(batch_id)])
+    if max_chunks is not None:
+        if isinstance(max_chunks, bool) or not isinstance(max_chunks, int) or max_chunks < 1:
+            raise ValueError("max_chunks must be a positive integer when supplied")
 
-            batch = cursor.fetchone()
+    batch_id = str(batch_id)
+    chunks_processed = 0
 
-            if not batch:
-                raise ValueError("Import batch not found")
+    while True:
 
-            supplier_id = batch[1]
+        with transaction.atomic():
 
-            cursor.execute("""
-                SELECT
-                    id,
-                    supplier_sku,
-                    product_name,
-                    manufacturer,
-                    brand,
-                    gtin,
-                    mpn,
-                    supplier_price,
-                    currency,
-                    stock_quantity,
-                    minimum_order_quantity,
-                    raw_record
-                FROM catalogue.supplier_import_rows
-                WHERE batch_id = %s
-                  AND status = 'PENDING'
-                ORDER BY row_number
-                FOR UPDATE
-            """, [str(batch_id)])
+            with connection.cursor() as cursor:
 
-            rows = cursor.fetchall()
+                # Only one reconciler may select/process rows from this batch
+                # during this chunk transaction.
+                cursor.execute("""
+                    SELECT id, supplier_id
+                    FROM catalogue.supplier_import_batches
+                    WHERE id = %s
+                    FOR UPDATE
+                """, [batch_id])
 
-            for row in rows:
+                batch = cursor.fetchone()
 
-                row_id = row[0]
+                if not batch:
+                    raise ValueError("Import batch not found")
 
-                try:
+                cursor.execute("""
+                    SELECT
+                        id,
+                        supplier_sku,
+                        product_name,
+                        manufacturer,
+                        brand,
+                        gtin,
+                        mpn,
+                        supplier_price,
+                        currency,
+                        stock_quantity,
+                        minimum_order_quantity,
+                        raw_record
+                    FROM catalogue.supplier_import_rows
+                    WHERE batch_id = %s
+                      AND status = 'PENDING'
+                    ORDER BY row_number
+                    LIMIT %s
+                    FOR UPDATE
+                """, [batch_id, chunk_size])
 
-                    # Each row is an independent savepoint.
-                    # A failed offer/link operation cannot leave
-                    # a partially registered supplier relationship.
+                rows = cursor.fetchall()
 
-                    with transaction.atomic():
+                for row in rows:
 
-                        status = _process_row(
-                            cursor,
-                            batch_id,
-                            row,
-                        )
+                    row_id = row[0]
 
-                    counts[status] += 1
+                    try:
+                        # Preserve per-row atomicity within the chunk.
+                        with transaction.atomic():
+                            status = _process_row(cursor, batch_id, row)
 
-                except IdentityConflict as exc:
+                        if status not in ("MATCHED", "UNMATCHED"):
+                            raise RuntimeError(
+                                "Unexpected reconciliation status: " + str(status)
+                            )
 
-                    cursor.execute("""
-                        UPDATE catalogue.supplier_import_rows
-                        SET status = 'CONFLICT',
-                            error_message = %s
-                        WHERE id = %s
-                    """, [
-                        str(exc)[:2000],
-                        str(row_id),
-                    ])
+                    except IdentityConflict as exc:
+                        cursor.execute("""
+                            UPDATE catalogue.supplier_import_rows
+                            SET status = 'CONFLICT',
+                                error_message = %s
+                            WHERE id = %s
+                        """, [str(exc)[:2000], str(row_id)])
 
-                    counts["CONFLICT"] += 1
+                    except (ValueError, InvalidOperation) as exc:
+                        cursor.execute("""
+                            UPDATE catalogue.supplier_import_rows
+                            SET status = 'INVALID',
+                                error_message = %s
+                            WHERE id = %s
+                        """, [str(exc)[:2000], str(row_id)])
 
-                except (ValueError, InvalidOperation) as exc:
+                    except IntegrityError as exc:
+                        cursor.execute("""
+                            UPDATE catalogue.supplier_import_rows
+                            SET status = 'CONFLICT',
+                                error_message = %s
+                            WHERE id = %s
+                        """, [str(exc)[:2000], str(row_id)])
 
-                    cursor.execute("""
-                        UPDATE catalogue.supplier_import_rows
-                        SET status = 'INVALID',
-                            error_message = %s
-                        WHERE id = %s
-                    """, [
-                        str(exc)[:2000],
-                        str(row_id),
-                    ])
+                # Recalculate from persisted states, including earlier
+                # committed chunks and any previous interrupted invocation.
+                cursor.execute("""
+                    SELECT status, COUNT(*)
+                    FROM catalogue.supplier_import_rows
+                    WHERE batch_id = %s
+                    GROUP BY status
+                """, [batch_id])
 
-                    counts["INVALID"] += 1
+                totals = dict(cursor.fetchall())
 
-                except IntegrityError as exc:
+                counts = {
+                    "MATCHED": totals.get("MATCHED", 0),
+                    "UNMATCHED": totals.get("UNMATCHED", 0),
+                    "CONFLICT": totals.get("CONFLICT", 0),
+                    "INVALID": totals.get("INVALID", 0),
+                }
 
-                    cursor.execute("""
-                        UPDATE catalogue.supplier_import_rows
-                        SET status = 'CONFLICT',
-                            error_message = %s
-                        WHERE id = %s
-                    """, [
-                        str(exc)[:2000],
-                        str(row_id),
-                    ])
+                pending_rows = totals.get("PENDING", 0)
 
-                    counts["CONFLICT"] += 1
+                if pending_rows:
+                    batch_status = "PROCESSING"
+                    completed_at_sql = "NULL"
+                else:
+                    batch_status = _batch_completion_status(counts)
+                    completed_at_sql = "NOW()"
 
-            cursor.execute("""
-                SELECT status, COUNT(*)
-                FROM catalogue.supplier_import_rows
-                WHERE batch_id = %s
-                GROUP BY status
-            """, [str(batch_id)])
+                cursor.execute(f"""
+                    UPDATE catalogue.supplier_import_batches
+                    SET status = %s,
+                        matched_rows = %s,
+                        unmatched_rows = %s,
+                        conflict_rows = %s,
+                        invalid_rows = %s,
+                        completed_at = {completed_at_sql}
+                    WHERE id = %s
+                """, [
+                    batch_status,
+                    counts["MATCHED"],
+                    counts["UNMATCHED"],
+                    counts["CONFLICT"],
+                    counts["INVALID"],
+                    batch_id,
+                ])
 
-            totals = dict(cursor.fetchall())
+        # The chunk transaction has committed here.
+        if rows:
+            chunks_processed += 1
 
-            counts = {
-                "MATCHED": totals.get("MATCHED", 0),
-                "UNMATCHED": totals.get("UNMATCHED", 0),
-                "CONFLICT": totals.get("CONFLICT", 0),
-                "INVALID": totals.get("INVALID", 0),
-            }
+        if pending_rows == 0:
+            break
 
-            errors = counts["CONFLICT"] + counts["INVALID"]
+        if not rows:
+            # Defensive stop: the batch lock was held while checking pending
+            # rows, so an empty selection with pending rows indicates an
+            # unexpected database/state inconsistency.
+            raise RuntimeError(
+                "No pending rows selected, but batch still reports pending rows"
+            )
 
-            cursor.execute("""
-                UPDATE catalogue.supplier_import_batches
-                SET status = %s,
-                    matched_rows = %s,
-                    unmatched_rows = %s,
-                    conflict_rows = %s,
-                    invalid_rows = %s,
-                    completed_at = NOW()
-                WHERE id = %s
-            """, [
-                "COMPLETED_WITH_ERRORS" if errors
-                else "COMPLETED",
-                counts["MATCHED"],
-                counts["UNMATCHED"],
-                counts["CONFLICT"],
-                counts["INVALID"],
-                str(batch_id),
-            ])
+        if max_chunks is not None and chunks_processed >= max_chunks:
+            break
 
     return counts
-
 
 def recover_import_batch(batch_id):
 

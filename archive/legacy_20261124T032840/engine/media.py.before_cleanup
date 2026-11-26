@@ -1,0 +1,166 @@
+"""Attach sourced or placeholder media. Provenance is PUBLIC-safe.
+
+Icecat fetch URLs carry ?content_token=...; product.metadata is readable via
+the storefront GraphQL API, so only sanitised URLs are ever persisted.
+"""
+import logging
+from django.core.files.base import ContentFile
+
+logger = logging.getLogger(__name__)
+
+
+def _identity(product):
+    v = product.variants.first()
+    sku = (v.sku if v else "") or str(product.id)
+    md = product.metadata or {}
+    return sku, md.get("brand", ""), md.get("mpn", "")
+
+
+def _drop_placeholders(product):
+    from saleor.product.models import ProductMedia
+    for m in product.media.all():
+        st = (m.metadata or {}).get("image_provenance", {}).get("status")
+        if st in ("placeholder", "branded_card"):
+            m.delete()
+
+
+def attach_image(product, data, ext, sha, prov, status="resolved") -> bool:
+    """Attach verified bytes. Never removes genuine media."""
+    from saleor.product.models import ProductMedia
+    try:
+        for existing in product.media.all():
+            ep = (existing.metadata or {}).get("image_provenance", {})
+            if ep.get("sha256") == sha and ep.get("status") == status:
+                return True
+        _drop_placeholders(product)
+        prov = dict(prov)
+        prov.update({"status": status, "sha256": sha,
+                     "pending_real_image": status == "placeholder"})
+        m = ProductMedia(product=product, type="IMAGE",
+                         alt=(product.name or prov.get("sku", ""))[:250],
+                         sort_order=product.media.count())
+        m.image.save(f"product_{product.id}.{ext}", ContentFile(data), save=False)
+        m.metadata = {"image_provenance": prov}
+        m.save()
+        md = dict(product.metadata or {})
+        md["image_provenance"] = prov
+        product.metadata = md
+        product.save(update_fields=["metadata"])
+        return True
+    except Exception:
+        logger.exception("attach_image failed pid=%s", product.pk)
+        return False
+
+
+def attach_placeholder(product) -> bool:
+    from saleor.product.models import ProductMedia
+    from .placeholder_image import generate_placeholder
+    try:
+        sku, brand, mpn = _identity(product)
+        data, ext, sha = generate_placeholder(brand, sku, mpn)
+        prov = {"status": "placeholder", "source_tier": "fallback",
+                "source_url": None, "brand": brand, "sku": sku, "mpn": mpn,
+                "confidence": 0.0, "license": "placeholder",
+                "sha256": sha, "pending_real_image": True}
+        _drop_placeholders(product)
+        m = ProductMedia(product=product, type="IMAGE",
+                         alt=(product.name or sku)[:250],
+                         sort_order=product.media.count())
+        m.image.save(f"placeholder_{product.id}.{ext}", ContentFile(data), save=False)
+        m.metadata = {"image_provenance": prov}
+        m.save()
+        md = dict(product.metadata or {})
+        md["image_provenance"] = prov
+        product.metadata = md
+        product.save(update_fields=["metadata"])
+        return True
+    except Exception:
+        logger.exception("attach_placeholder failed pid=%s", product.pk)
+        return False
+
+# ============================================================
+# TIER 3: BRANDED PLACEHOLDER GENERATION
+# ============================================================
+from PIL import Image, ImageDraw, ImageFont
+import hashlib
+
+def generate_branded_placeholder(brand: str, sku: str, category: str):
+    """Generates a clean, professional 800x600 placeholder image."""
+    width, height = 800, 600
+    # Professional light gray background
+    img = Image.new('RGB', (width, height), color=(245, 247, 250))
+    draw = ImageDraw.Draw(img)
+    
+    # Try to load a nice font, fallback to default if unavailable
+    try:
+        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+        font_medium = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/Sans.ttf", 18)
+    except IOError:
+        font_large = ImageFont.load_default()
+        font_medium = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+
+    # Draw top accent bar
+    draw.rectangle([0, 0, width, 8], fill=(37, 99, 235)) # CAAG Blue
+    
+    # Brand Name
+    brand_text = (brand or "UNKNOWN BRAND").upper()[:40]
+    draw.text((40, 40), brand_text, fill=(37, 99, 235), font=font_large)
+    
+    # Category
+    cat_text = (category or "Uncategorized").title()
+    draw.text((40, 90), cat_text, fill=(107, 114, 128), font=font_medium)
+    
+    # Central "Image Pending" Badge
+    badge_w, badge_h = 400, 120
+    badge_x, badge_y = (width - badge_w) // 2, (height - badge_h) // 2
+    draw.rounded_rectangle([badge_x, badge_y, badge_x + badge_w, badge_y + badge_h], radius=12, fill=(255, 255, 255), outline=(226, 232, 240), width=2)
+    draw.text((width // 2, height // 2), "IMAGE PENDING", fill=(107, 114, 128), font=font_medium, anchor="mm")
+    
+    # SKU at the bottom
+    sku_text = f"SKU: {sku or 'N/A'}"
+    draw.text((width // 2, height - 60), sku_text, fill=(107, 114, 128), font=font_small, anchor="mm")
+    
+    # Save to bytes
+    img_bytes = io.BytesIO()
+    img.save(img_bytes, format="PNG", optimize=True)
+    data = img_bytes.getvalue()
+    sha256 = hashlib.sha256(data).hexdigest()
+    
+    return data, "png", sha256
+
+def attach_branded_placeholder(product, variant):
+    """Attaches a generated placeholder if no real image exists."""
+    from saleor.product.models import ProductMedia
+    
+    # Check if media already exists to avoid duplicates
+    if product.media.exists():
+        return False
+        
+    brand = (product.metadata or {}).get("brand", "")
+    category = product.category.name if product.category else ""
+    sku = variant.sku if variant else str(product.id)
+    
+    data, ext, sha256 = generate_branded_placeholder(brand, sku, category)
+    
+    prov = {
+        "status": "placeholder",
+        "source_tier": "generated_fallback",
+        "source_url": None,
+        "brand": brand,
+        "sku": sku,
+        "confidence": 0.0,
+        "license": "generated",
+        "sha256": sha256
+    }
+    
+    media = ProductMedia.objects.create(
+        product=product,
+        type="IMAGE",
+        alt=f"{brand} {sku} Placeholder",
+        sort_order=0,
+        metadata={"image_provenance": prov}
+0)
+    media.image.save(f"placeholder_{product.id}_{sku}.png", ContentFile(data), save=True)
+    return True

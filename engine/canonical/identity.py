@@ -38,3 +38,63 @@ def resolve_identity(normalized_row) -> Tuple[str, Optional[ProductVariant], Opt
         return MatchResult.FUZZY, None, product
 
     return MatchResult.NONE, None, None
+
+
+
+# ------------------------------------------------------------
+# Canonical supplier identifier normalisation
+# ------------------------------------------------------------
+
+def normalize_gtin(value):
+    """Validate a GTIN-8/12/13/14 and return its 14-digit form."""
+    if value is None or isinstance(value, bool):
+        return None
+
+    text = str(value).strip()
+
+    if not text:
+        return None
+
+    if not text.isascii() or not text.isdigit():
+        raise ValueError("GTIN must contain digits only")
+
+    if len(text) not in (8, 12, 13, 14):
+        raise ValueError("GTIN must contain 8, 12, 13 or 14 digits")
+
+    payload = text[:-1]
+    supplied_check_digit = int(text[-1])
+
+    weighted_sum = sum(
+        int(digit) * (3 if position % 2 == 0 else 1)
+        for position, digit in enumerate(reversed(payload))
+    )
+    expected_check_digit = (10 - weighted_sum % 10) % 10
+
+    if supplied_check_digit != expected_check_digit:
+        raise ValueError("Invalid GTIN check digit")
+
+    return text.zfill(14)
+
+
+def normalize_mpn(value):
+    """Normalise an MPN without altering punctuation or leading zeroes."""
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        raise ValueError("Invalid MPN")
+
+    text = " ".join(str(value).strip().upper().split())
+    return text or None
+
+
+def normalize_manufacturer(value):
+    """Normalise manufacturer names consistently for identifier namespaces."""
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        raise ValueError("Invalid manufacturer")
+
+    text = " ".join(str(value).strip().upper().split())
+    return text or None

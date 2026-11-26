@@ -190,3 +190,59 @@ def normalize_row(row: dict):
         source_product_type=source_product_type,
         supplier_status=status,
     )
+
+
+# ---------------------------------------------------------------------------
+# Legacy compatibility interface used by readers.py and validators.py.
+# Keep these wrappers separate from normalize_row()'s canonical output.
+# ---------------------------------------------------------------------------
+
+def clean(value):
+    """Compatibility wrapper for the existing string cleaner."""
+    return _clean(value)
+
+
+def normalise_record(record):
+    """Clean raw supplier record values while preserving source column names."""
+    if not isinstance(record, dict):
+        raise TypeError("Supplier record must be a dictionary")
+    return {key: _clean(value) for key, value in record.items()}
+
+
+def normalise_decimal(value, field_name="value"):
+    """Strict decimal validation for supplier feed fields."""
+    text = _clean(value)
+    if not text:
+        return None
+
+    cleaned = re.sub(r"[^0-9.\\-]", "", text)
+
+    try:
+        result = Decimal(cleaned)
+        if not result.is_finite():
+            raise InvalidOperation
+        return result
+    except (InvalidOperation, ValueError):
+        raise ValueError(
+            f"Invalid decimal value for {field_name}: {text!r}"
+        ) from None
+
+
+def normalise_integer(value, field_name="value"):
+    """Strict integer validation; fractional quantities are rejected."""
+    text = _clean(value)
+    if not text:
+        return None
+
+    cleaned = re.sub(r"[^0-9.\\-]", "", text)
+
+    try:
+        number = Decimal(cleaned)
+        if not number.is_finite() or number != number.to_integral_value():
+            raise InvalidOperation
+        return int(number)
+    except (InvalidOperation, ValueError):
+        raise ValueError(
+            f"Invalid integer value for {field_name}: {text!r}"
+        ) from None
+

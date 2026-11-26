@@ -25,13 +25,15 @@ def run_import(csv_path, default_channel_id, default_warehouse_id, default_produ
         if not batch:
             return
         try:
-            for k, v in (write_batch(
+            result = write_batch(
                 batch,
                 default_product_type_id,
                 default_channel_id,
                 default_warehouse_id,
-            ) or {}).items():
-                stats[k] += v
+            ) or {}
+            for k, v in result.items():
+                if isinstance(v, (int, float)):
+                    stats[k] += v
         except Exception as e:
             logger.exception("batch failed (%d rows): %s", len(batch), e)
             stats["batch_failed_rows"] += len(batch)
@@ -74,20 +76,6 @@ def run_import(csv_path, default_channel_id, default_warehouse_id, default_produ
             for rec in failed:
                 fh.write(json.dumps(rec, default=str) + "\n")
         logger.warning("DLQ: %d records -> %s", len(failed), dlq)
-
-    try:
-        from imports.importer.engine.post_import import run as post_import_run, caag_run_post_import_fixes
-        post_stats = post_import_run(
-            channel_id=default_channel_id,
-            warehouse_id=default_warehouse_id,
-        )
-        stats.update(post_stats)
-        
-        # CAAG Post-Import Hook
-        caag_run_post_import_fixes()
-    except Exception as e:
-        logger.exception("post-import failed: %s", e)
-        stats["post_import_failed"] = 1
 
     logger.info("Import complete. Stats: %s", dict(stats))
     return dict(stats)

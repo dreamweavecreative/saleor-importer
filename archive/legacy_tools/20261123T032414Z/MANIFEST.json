@@ -1,0 +1,36 @@
+{
+  "created_utc": "20261123T032414Z",
+  "files": {
+    "apply_scrappa_integration.py": {
+      "original_location": "imports/importer/apply_scrappa_integration.py",
+      "quarantined_location": "imports/importer/archive/legacy_tools/20261123T032414Z/apply_scrappa_integration.py",
+      "sha256": "dee1868c1dc433c164d56562494330dd366c30e7af8004ac1a1a285546540b24"
+    },
+    "diagnose_image_sources.py": {
+      "original_location": "imports/importer/diagnose_image_sources.py",
+      "quarantined_location": "imports/importer/archive/legacy_tools/20261123T032414Z/diagnose_image_sources.py",
+      "sha256": "1d537f6e3a99d5d94d6f6bdfc1204b2aae8e9bbc8bc2dc43356a76ec33455fed"
+    },
+    "fixscrappa.sh": {
+      "original_location": "imports/importer/fixscrappa.sh",
+      "quarantined_location": "imports/importer/archive/legacy_tools/20261123T032414Z/fixscrappa.sh",
+      "sha256": "ebbf4bf090417ac422c71b1d2e606ace8609aea8fc9a301ffb9e2e2a50086205"
+    },
+    "probe_providers.py": {
+      "original_location": "imports/importer/probe_providers.py",
+      "quarantined_location": "imports/importer/archive/legacy_tools/20261123T032414Z/probe_providers.py",
+      "sha256": "7bcf3291f7d4cf19dad8ede8664ea6152cedf95288c18055f11f9f7f68a1e73a"
+    },
+    "run_media_sample.py": {
+      "original_location": "imports/importer/run_media_sample.py",
+      "quarantined_location": "imports/importer/archive/legacy_tools/20261123T032414Z/run_media_sample.py",
+      "sha256": "fe9e4a66e3db5904029e3e19b749726ac99d25ff83f156d371ef14139885011e"
+    },
+    "sample_image_sources.py": {
+      "original_location": "imports/importer/sample_image_sources.py",
+      "quarantined_location": "imports/importer/archive/legacy_tools/20261123T032414Z/sample_image_sources.py",
+      "sha256": "88d3e35309d50516e1e8bcca9bc208bade73ac49de66f07da177040c672905d1"
+    }
+  },
+  "reason": "Superseded operational scripts; retained for recovery."
+}

@@ -6,7 +6,7 @@ from .normalizers import (
     normalise_integer,
 )
 
-from importer.config.suppliers import get_supplier_profile
+from ..config.suppliers import get_supplier_profile
 
 
 def validate_record(record, supplier_id="dickerdata"):
